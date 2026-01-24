@@ -1,5 +1,6 @@
 # Data (rsync-only)
 data/
+mats/master_lib.mat
 
 # Python
 __pycache__/

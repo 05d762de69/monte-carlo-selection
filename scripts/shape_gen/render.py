@@ -82,6 +82,9 @@ def draw_and_save(
         shifted[:, 0] = shifted[:, 0] - float(minX)
         shifted[:, 1] = shifted[:, 1] - float(minY)
 
+        shifted[:, 1] = float(hBB) - shifted[:, 1]
+
+
         # Supersample scaling
         shifted *= float(ss)
 

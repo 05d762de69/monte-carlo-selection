@@ -11,6 +11,17 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+
+from shape_gen.generate3 import (
+    _extract_intersections_AB_and_visible_arc,
+    _choose_donor_index,
+    _validate_inside,
+    _is_simple_polyline,
+    _flexible_refit_spline_inside,
+    CompletionMeta,
+)
+
+
 import json
 import math
 import numpy as np
@@ -290,3 +301,18 @@ def generate_completions(
         i += 1
 
     return metas, out_files_xy, polygons_xy
+
+# ============================================================
+# Metadata I/O
+# ============================================================
+
+def save_metadata_jsonl(metas: List["CompletionMeta"], path: str | Path) -> None:
+    """
+    Save completion metadata as JSONL, one JSON object per line.
+    Uses dataclasses.asdict so it stays stable across versions.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for m in metas:
+            f.write(json.dumps(asdict(m)) + "\n")

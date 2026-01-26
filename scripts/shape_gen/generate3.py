@@ -54,13 +54,6 @@ class CompletionMeta:
     out_file: str
     attempts: int
     valid: bool
-        # corridor warping behavior (NEW)
-    warp_enabled: bool
-    warp_k_modes: int
-    warp_amp_rel: float
-    warp_n_steps: int
-    warp_max_attempts: int
-    warp_decay: float
 
 
 
@@ -143,6 +136,203 @@ def _indices_between(a: int, b: int, n: int) -> np.ndarray:
 def _arc_points(curve_xy: np.ndarray, idxs: np.ndarray) -> np.ndarray:
     return curve_xy[idxs, :]
 
+def _unique_points_eps(P: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    if P.size == 0:
+        return P.reshape(0, 2)
+    out = []
+    for p in P:
+        if not out:
+            out.append(p)
+            continue
+        d2 = np.sum((np.asarray(out) - p[None, :]) ** 2, axis=1)
+        if float(np.min(d2)) > (eps * eps):
+            out.append(p)
+    return np.asarray(out, dtype=np.float64)
+
+
+def _edge_boundary_crossings(sil_xy: np.ndarray, occ_poly: Polygon) -> np.ndarray:
+    """
+    Robust fallback. Finds crossings of the occluder boundary by scanning
+    silhouette segments for inside/outside changes, then interpolating.
+    Returns an array of candidate intersection points.
+    """
+    sil = np.asarray(sil_xy, dtype=np.float64)
+    if sil.shape[0] < 2:
+        return np.zeros((0, 2), dtype=np.float64)
+
+    # ensure closed for edge scan
+    if not np.allclose(sil[0], sil[-1]):
+        sil = np.vstack([sil, sil[0]])
+
+    # inside test at vertices
+    inside = np.array([occ_poly.contains(Point(float(x), float(y))) or occ_poly.touches(Point(float(x), float(y)))
+                       for x, y in sil], dtype=bool)
+
+    pts = []
+    boundary = occ_poly.boundary
+
+    for i in range(len(sil) - 1):
+        a = sil[i]
+        b = sil[i + 1]
+        ia = inside[i]
+        ib = inside[i + 1]
+
+        if ia == ib:
+            continue
+
+        # segment crosses boundary somewhere. Use shapely intersection on this small segment.
+        seg = LineString([a.tolist(), b.tolist()])
+        inter = seg.intersection(boundary)
+
+        if inter.is_empty:
+            continue
+
+        if inter.geom_type == "Point":
+            pts.append([inter.x, inter.y])
+        elif inter.geom_type == "MultiPoint":
+            for g in inter.geoms:
+                pts.append([g.x, g.y])
+        elif inter.geom_type in ("LineString", "MultiLineString"):
+            u = unary_union(inter)
+            if u.geom_type == "LineString":
+                coords = np.asarray(u.coords, dtype=np.float64)
+                pts.append(coords[0].tolist())
+                pts.append(coords[-1].tolist())
+            elif u.geom_type == "MultiLineString":
+                for ls in u.geoms:
+                    coords = np.asarray(ls.coords, dtype=np.float64)
+                    pts.append(coords[0].tolist())
+                    pts.append(coords[-1].tolist())
+
+    P = np.asarray(pts, dtype=np.float64)
+    P = _unique_points_eps(P, eps=1e-6)
+    return P
+
+
+def _extract_intersections_AB_and_visible_arc_robust(
+    sil_xy: np.ndarray,
+    occ_xy: np.ndarray,
+    *,
+    snap_to_silhouette_vertices: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, object]:
+    """
+    Drop-in replacement for _extract_intersections_AB_and_visible_arc.
+    Uses your original logic. Adds fallback paths when Shapely yields <2 points.
+    """
+    sil = np.asarray(sil_xy, dtype=np.float64)
+    occ = np.asarray(occ_xy, dtype=np.float64)
+
+    # clean polygons, avoids some degeneracies
+    occ_poly = Polygon(occ.tolist())
+    if not occ_poly.is_valid:
+        occ_poly = occ_poly.buffer(0)
+
+    # Ensure silhouette closed for intersection
+    sil_closed = sil
+    if not np.allclose(sil_closed[0], sil_closed[-1]):
+        sil_closed = np.vstack([sil_closed, sil_closed[0]])
+
+    occ_boundary = occ_poly.boundary
+    sil_line = LineString(sil_closed.tolist())
+
+    def _collect_pts_from_inter(inter) -> np.ndarray:
+        pts = []
+        if inter.is_empty:
+            return np.zeros((0, 2), dtype=np.float64)
+        if isinstance(inter, MultiPoint):
+            for g in inter.geoms:
+                pts.append([g.x, g.y])
+        elif isinstance(inter, GeometryCollection):
+            for g in inter.geoms:
+                if g.geom_type == "Point":
+                    pts.append([g.x, g.y])
+                elif g.geom_type == "MultiPoint":
+                    for gg in g.geoms:
+                        pts.append([gg.x, gg.y])
+                elif g.geom_type in ("LineString", "MultiLineString"):
+                    u = unary_union(g)
+                    if u.geom_type == "LineString":
+                        coords = np.asarray(u.coords, dtype=np.float64)
+                        pts.append(coords[0].tolist())
+                        pts.append(coords[-1].tolist())
+                    elif u.geom_type == "MultiLineString":
+                        for ls in u.geoms:
+                            coords = np.asarray(ls.coords, dtype=np.float64)
+                            pts.append(coords[0].tolist())
+                            pts.append(coords[-1].tolist())
+        elif inter.geom_type == "Point":
+            pts.append([inter.x, inter.y])
+        elif inter.geom_type in ("LineString", "MultiLineString"):
+            u = unary_union(inter)
+            if u.geom_type == "LineString":
+                coords = np.asarray(u.coords, dtype=np.float64)
+                pts.append(coords[0].tolist())
+                pts.append(coords[-1].tolist())
+            elif u.geom_type == "MultiLineString":
+                for ls in u.geoms:
+                    coords = np.asarray(ls.coords, dtype=np.float64)
+                    pts.append(coords[0].tolist())
+                    pts.append(coords[-1].tolist())
+
+        P = np.asarray(pts, dtype=np.float64)
+        return _unique_points_eps(P, eps=1e-6)
+
+    # 1) original shapely intersection
+    inter = sil_line.intersection(occ_boundary)
+    P = _collect_pts_from_inter(inter)
+
+    # 2) fallback: scan edges for crossings
+    if P.shape[0] < 2:
+        P2 = _edge_boundary_crossings(sil, occ_poly)
+        if P2.shape[0] >= 2:
+            P = P2
+
+    # 3) tangency breaker: tiny buffer around boundary
+    if P.shape[0] < 2:
+        eps = 1e-3
+        boundary2 = occ_poly.buffer(eps).boundary
+        inter2 = sil_line.intersection(boundary2)
+        P3 = _collect_pts_from_inter(inter2)
+        if P3.shape[0] >= 2:
+            P = P3
+
+    if P.shape[0] < 2:
+        raise RuntimeError(f"Expected >=2 intersection points, got {P.shape[0]}.")
+
+    # Now reuse the remainder of your original logic
+    pA, pB = _pick_two_farthest_points_xy(P)
+
+    if snap_to_silhouette_vertices:
+        n = sil.shape[0]
+        idxA = _nearest_index(sil, pA)
+        idxB = _nearest_index(sil, pB)
+        pA = sil[idxA].copy()
+        pB = sil[idxB].copy()
+    else:
+        idxA = _nearest_index(sil, pA)
+        idxB = _nearest_index(sil, pB)
+
+    n = sil.shape[0]
+    arc_AtoB = _indices_between(idxA, idxB, n)
+    arc_BtoA = _indices_between(idxB, idxA, n)
+
+    arc1 = _arc_points(sil, arc_AtoB)
+    arc2 = _arc_points(sil, arc_BtoA)
+
+    prepared = prep(occ_poly)
+    inside1 = np.array([prepared.contains(Point(float(x), float(y))) for x, y in arc1], dtype=np.float64).mean()
+    inside2 = np.array([prepared.contains(Point(float(x), float(y))) for x, y in arc2], dtype=np.float64).mean()
+
+    if inside1 >= inside2:
+        visible_arc = arc2
+    else:
+        visible_arc = arc1[::-1].copy()
+
+    visible_arc = np.asarray(visible_arc, dtype=np.float64)
+    visible_arc[0] = pB
+    visible_arc[-1] = pA
+
+    return pA, pB, visible_arc, prepared
 
 def _extract_intersections_AB_and_visible_arc(
     sil_xy: np.ndarray,
@@ -495,12 +685,39 @@ def generate_completions(
     sil = np.asarray(silhouette, dtype=np.float64)
     occ_xy = np.asarray(occluder, dtype=np.float64)
 
-    pA_true, pB_true, visible_arc, prepared_occ = _extract_intersections_AB_and_visible_arc(
-        sil_xy=sil,
-        occ_xy=occ_xy,
-        snap_to_silhouette_vertices=bool(snap_intersections_to_vertices),
-    )
     occ_poly = Polygon(occ_xy.tolist())
+    prepared_occ = prep(occ_poly)
+
+    # Use caller-provided endpoints. This avoids intersection degeneracies in small ovals.
+    pA_true = np.asarray(start_pt, dtype=np.float64).copy()
+    pB_true = np.asarray(end_pt, dtype=np.float64).copy()
+
+    # Visible arc should still be computed, but we can compute it WITHOUT relying on intersection geometry.
+    # We’ll derive indices by nearest silhouette vertices to pA_true/pB_true.
+    sil0 = sil
+    n = sil0.shape[0]
+    idxA = _nearest_index(sil0, pA_true)
+    idxB = _nearest_index(sil0, pB_true)
+
+    arc_AtoB = _indices_between(idxA, idxB, n)
+    arc_BtoA = _indices_between(idxB, idxA, n)
+
+    arc1 = _arc_points(sil0, arc_AtoB)
+    arc2 = _arc_points(sil0, arc_BtoA)
+
+    inside1 = np.array([prepared_occ.contains(Point(float(x), float(y))) for x, y in arc1], dtype=np.float64).mean()
+    inside2 = np.array([prepared_occ.contains(Point(float(x), float(y))) for x, y in arc2], dtype=np.float64).mean()
+
+    # pick the arc that is mostly OUTSIDE the occluder as "visible"
+    if inside1 >= inside2:
+        visible_arc = arc2
+    else:
+        visible_arc = arc1[::-1].copy()
+
+    visible_arc = np.asarray(visible_arc, dtype=np.float64)
+    visible_arc[0] = pB_true
+    visible_arc[-1] = pA_true
+
 
     metas: List[CompletionMeta] = []
     out_files_xy: List[str] = []

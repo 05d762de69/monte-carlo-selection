@@ -1,5 +1,5 @@
 # =========================
-# PATCH: shape_gen/generate3.py
+# PATCH: shape_gen/generate_parallel.py
 # =========================
 # Apply these edits to your existing file.
 # I’m showing the full generate_completions function with only the relevant changes.
@@ -13,13 +13,16 @@ from typing import Dict, List, Optional, Tuple
 
 
 from shape_gen.generate3 import (
-    _extract_intersections_AB_and_visible_arc,
     _choose_donor_index,
     _validate_inside,
     _is_simple_polyline,
     _flexible_refit_spline_inside,
+    _nearest_index,
+    _indices_between,
+    _arc_points,
     CompletionMeta,
 )
+
 
 
 import json
@@ -38,6 +41,22 @@ from shape_gen.donor_fit import DonorFitParams, donor_occluder_fit
 
 # ... keep the rest of your helpers as-is ...
 
+def _nearest_index(curve_xy: np.ndarray, p: np.ndarray) -> int:
+    curve_xy = np.asarray(curve_xy, dtype=np.float64)
+    p = np.asarray(p, dtype=np.float64)
+    d2 = np.sum((curve_xy - p[None, :]) ** 2, axis=1)
+    return int(np.argmin(d2))
+
+
+def _indices_between(a: int, b: int, n: int) -> np.ndarray:
+    if a <= b:
+        return np.arange(a, b + 1)
+    return np.concatenate([np.arange(a, n), np.arange(0, b + 1)])
+
+
+def _arc_points(curve_xy: np.ndarray, idxs: np.ndarray) -> np.ndarray:
+    curve_xy = np.asarray(curve_xy, dtype=np.float64)
+    return curve_xy[idxs, :]
 
 def generate_completions(
     *,
@@ -104,12 +123,47 @@ def generate_completions(
     sil = np.asarray(silhouette, dtype=np.float64)
     occ_xy = np.asarray(occluder, dtype=np.float64)
 
-    pA_true, pB_true, visible_arc, prepared_occ = _extract_intersections_AB_and_visible_arc(
-        sil_xy=sil,
-        occ_xy=occ_xy,
-        snap_to_silhouette_vertices=bool(snap_intersections_to_vertices),
-    )
     occ_poly = Polygon(occ_xy.tolist())
+    prepared_occ = prep(occ_poly)
+
+    # Use the endpoints provided by the caller. This avoids Shapely intersection degeneracies.
+    pA_true = np.asarray(start_pt, dtype=np.float64).copy()
+    pB_true = np.asarray(end_pt, dtype=np.float64).copy()
+
+    # Construct visible arc by nearest silhouette indexing to pA/pB.
+    # This is robust even when Shapely returns 1 intersection due to tangency/degeneracy.
+    sil0 = sil
+    n = sil0.shape[0]
+
+    # These helpers come from generate3.py, same as before.
+    idxA = _nearest_index(sil0, pA_true)
+    idxB = _nearest_index(sil0, pB_true)
+
+    arc_AtoB = _indices_between(idxA, idxB, n)
+    arc_BtoA = _indices_between(idxB, idxA, n)
+
+    arc1 = _arc_points(sil0, arc_AtoB)
+    arc2 = _arc_points(sil0, arc_BtoA)
+
+    # Visible arc should be the arc mostly OUTSIDE the occluder.
+    inside1 = np.array(
+        [prepared_occ.contains(Point(float(x), float(y))) for x, y in arc1],
+        dtype=np.float64
+    ).mean()
+    inside2 = np.array(
+        [prepared_occ.contains(Point(float(x), float(y))) for x, y in arc2],
+        dtype=np.float64
+    ).mean()
+
+    if inside1 >= inside2:
+        visible_arc = arc2
+    else:
+        visible_arc = arc1[::-1].copy()
+
+    visible_arc = np.asarray(visible_arc, dtype=np.float64)
+    visible_arc[0] = pB_true
+    visible_arc[-1] = pA_true
+
 
     metas: List[CompletionMeta] = []
     out_files_xy: List[str] = []

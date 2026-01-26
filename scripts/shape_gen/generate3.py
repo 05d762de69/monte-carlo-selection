@@ -16,6 +16,8 @@ from shapely.ops import unary_union, nearest_points
 from shape_gen.segments import extract_random_segment
 from shape_gen.render import draw_and_save
 from shape_gen.io_mat import unit_to_pixel
+from shape_gen.warp_inside import warp_segment_inside
+
 
 # Donor-based fitting (natural shapes).
 from shape_gen.donor_fit import DonorFitParams, donor_occluder_fit
@@ -52,6 +54,14 @@ class CompletionMeta:
     out_file: str
     attempts: int
     valid: bool
+        # corridor warping behavior (NEW)
+    warp_enabled: bool
+    warp_k_modes: int
+    warp_amp_rel: float
+    warp_n_steps: int
+    warp_max_attempts: int
+    warp_decay: float
+
 
 
 def save_metadata_jsonl(metas: List[CompletionMeta], path: str | Path) -> None:
@@ -436,6 +446,14 @@ def generate_completions(
     byClass: Dict[str, np.ndarray],
     n_images: int,
     rng: np.random.Generator,
+        # corridor warping behavior (NEW)
+    warp_enabled: bool = True,
+    warp_k_modes: int = 6,
+    warp_amp_rel: float = 0.06,
+    warp_n_steps: int = 2,
+    warp_max_attempts: int = 10,
+    warp_decay: float = 0.65,
+
 
     # donor segment sampling
     fraction: float = 0.40,
@@ -577,6 +595,26 @@ def generate_completions(
                 if not _is_simple_polyline(refined):
                     continue
                 aligned_segment = refined
+                        # Corridor warping. Donor is the prior, warp explores feasible diversity.
+            if warp_enabled:
+                warped = warp_segment_inside(
+                    aligned_segment,
+                    pA=pA_true,
+                    pB=pB_true,
+                    occ_poly=occ_poly,
+                    prepared_occ=prepared_occ,
+                    rng=rng,
+                    validate_inside_fn=_validate_inside,
+                    is_simple_fn=_is_simple_polyline,
+                    k_modes=int(warp_k_modes),
+                    amp_rel=float(warp_amp_rel),
+                    n_steps=int(warp_n_steps),
+                    max_attempts=int(warp_max_attempts),
+                    decay=float(warp_decay),
+                )
+                if warped.size == 0:
+                    continue
+                aligned_segment = warped
 
             # Stitch polygon as: (inside completion) pA->pB, then (visible arc) pB->pA.
             new_shape = np.vstack([aligned_segment, visible_arc[1:]])
